@@ -1,71 +1,100 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdlib.h>
-#include <sys/types.h> 
-#include <sys/socket.h>
 #include <arpa/inet.h>
-#include "utils.h"
+#include <errno.h>
 
+struct msg {
+    int id;
+    double temp;
+    int done;
+};
 
-int main (int argc, char *argv[])
-{
-    int socket_desc;
-    struct sockaddr_in server_addr;
-    char server_message[100], client_message[100];
-
-    struct msg the_message; 
-    
-    // Command-line input arguments (user provided)
-    int externalIndex = atoi(argv[1]); 
-    float initialTemperature = atof(argv[2]); 
-
-    
-    // Create socket:
-    socket_desc = socket(AF_INET, SOCK_STREAM, 0);
-    
-    if(socket_desc < 0){
-        printf("Unable to create socket\n");
-        return -1;
+ssize_t full_read(int fd, void *buf, size_t count) {
+    size_t left = count;
+    char *p = buf;
+    while (left) {
+        ssize_t r = read(fd, p, left);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) break;
+        left -= r;
+        p += r;
     }
-    
-    printf("Socket created successfully\n");
-    
-    // Set port and IP the same as server-side:
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(2000);
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-        
+    return count - left;
+}
 
-    // Send connection request to server:
-    if(connect(socket_desc, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0){
-        printf("Unable to connect\n");
-        return -1;
+ssize_t full_write(int fd, const void *buf, size_t count) {
+    size_t left = count;
+    const char *p = buf;
+    while (left) {
+        ssize_t w = write(fd, p, left);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        left -= w;
+        p += w;
     }
-    printf("Connected with server successfully\n");
-    printf("--------------------------------------------------------\n\n");
-       
-    // Package to the sent to server 
-    the_message = prepare_message(externalIndex, initialTemperature); 
+    return count;
+}
 
-    // Send the message to server:
-    if(send(socket_desc, (const void *)&the_message, sizeof(the_message), 0) < 0){
-        printf("Unable to send message\n");
-        return -1;
+int main(int argc, char *argv[]) {
+    if (argc != 5) {
+        fprintf(stderr, "Usage: %s <id 1-4> <initial_temp> <server_ip> <port>\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
- 
 
-    // Receive the server's response:
-    if(recv(socket_desc, (void *)&the_message, sizeof(the_message), 0) < 0){
-        printf("Error while receiving server's msg\n");
-        return -1;
+    int id = atoi(argv[1]);
+    if (id < 1 || id > 4) {
+        fprintf(stderr, "Client id must be 1..4\n");
+        exit(EXIT_FAILURE);
     }
-    
-    printf("--------------------------------------------------------\n");
-    printf("Updated temperature sent by the Central process = %f\n", the_message.T);
-    
-    // Close the socket:
-    close(socket_desc);
-    
+    double external = atof(argv[2]);
+    char *server_ip = argv[3];
+    int port = atoi(argv[4]);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) { perror("socket"); exit(EXIT_FAILURE); }
+
+    struct sockaddr_in srv;
+    memset(&srv,0,sizeof(srv));
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(port);
+    if (inet_pton(AF_INET, server_ip, &srv.sin_addr) <= 0) { perror("inet_pton"); exit(EXIT_FAILURE); }
+
+    if (connect(sock, (struct sockaddr*)&srv, sizeof(srv)) < 0) { perror("connect"); exit(EXIT_FAILURE); }
+    printf("Client%d: connected to %s:%d, initial=%.6f\n", id, server_ip, port, external);
+
+    struct msg out = { id, external, 0 };
+    full_write(sock, &out, sizeof(out));
+
+    while (1) {
+        struct msg in;
+        ssize_t r = full_read(sock, &in, sizeof(in));
+        if (r != sizeof(in)) {
+            fprintf(stderr, "Client%d: read returned %zd\n", id, r);
+            perror("read");
+            close(sock);
+            exit(EXIT_FAILURE);
+        }
+
+        if (in.done) {
+            printf("Client%d: DONE received. final stabilized temp = %.6f\n", id, in.temp);
+            break;
+        } else {
+            double central = in.temp;
+            external = (3.0 * external + 2.0 * central) / 5.0;
+            printf("Client%d: recv central=%.6f -> updated external=%.6f\n", id, central, external);
+            struct msg sendm = { id, external, 0 };
+            full_write(sock, &sendm, sizeof(sendm));
+        }
+    }
+
+    close(sock);
+    printf("Client%d: exiting\n", id);
     return 0;
 }
